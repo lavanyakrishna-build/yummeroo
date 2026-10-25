@@ -1,0 +1,87 @@
+name: Recipe sync
+
+# Every 6 hours, copy new recipes from the "Yummeroo Recipes" spreadsheet
+# into the website. Can also be started by hand from the Actions tab.
+on:
+  schedule:
+    - cron: "47 1,7,13,19 * * *"   # about 6:47 pm, 12:47 am, 6:47 am, 12:47 pm Pacific
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: recipe-sync
+  cancel-in-progress: false
+
+env:
+  SHEET_ID: 1ZWm-GedAW1nJMia_teIRWT4Uoh6xqN1Q
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Get the sync script
+        uses: actions/checkout@v4
+        with:
+          path: tools
+
+      - name: Get the website
+        uses: actions/checkout@v4
+        with:
+          ref: gh-pages
+          path: site
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install openpyxl==3.1.5
+
+      - name: Download the recipe spreadsheet
+        run: |
+          curl -fsSL --retry 3 -o recipes.xlsx \
+            "https://drive.usercontent.google.com/download?id=${SHEET_ID}&export=download&confirm=t"
+          # A real .xlsx starts with "PK". Anything else is usually a Google
+          # sign-in page, meaning the sheet isn't shared "anyone with the link".
+          if [ "$(head -c 2 recipes.xlsx)" != "PK" ]; then
+            echo "::error::Couldn't download the spreadsheet. Check it is shared as 'Anyone with the link can view'."
+            exit 1
+          fi
+
+      - name: Update the recipes if the spreadsheet changed
+        id: sync
+        run: |
+          new_sha=$(sha256sum recipes.xlsx | cut -c1-64)
+          old_sha=$(cat site/.recipes-sha 2>/dev/null || true)
+          if [ "$new_sha" = "$old_sha" ]; then
+            echo "Spreadsheet unchanged since the last sync."
+            exit 0
+          fi
+          python3 -I tools/scripts/yummeroo_sync.py --xlsx recipes.xlsx \
+            --page site/index.html --modified "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --out new.html > result.json
+          cat result.json
+          status=$(python3 -c "import json; print(json.load(open('result.json'))['status'])")
+          count=$(python3 -c "import json; print(json.load(open('result.json')).get('recipes', ''))")
+          if [ "$status" = "abort" ]; then
+            echo "::error::Sync stopped: $(python3 -c "import json; print(json.load(open('result.json'))['reason'])")"
+            exit 1
+          fi
+          echo "$new_sha" > site/.recipes-sha
+          if [ "$status" = "updated" ] || [ "$status" = "no_changes" ]; then
+            cp new.html site/index.html
+          fi
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+
+      - name: Publish
+        if: steps.sync.outputs.count != ''
+        working-directory: site
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add index.html .recipes-sha
+          if git diff --cached --quiet; then echo "Nothing to publish."; exit 0; fi
+          git commit -m "Recipe sync: ${{ steps.sync.outputs.count }} recipes"
+          git push origin gh-pages
