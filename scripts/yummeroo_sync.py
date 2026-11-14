@@ -391,6 +391,89 @@ def clean_text(s):
     return s.strip()
 
 
+def num(v):
+    """A whole number from a nutrition cell, or None (blank, text, or a formula)."""
+    if isinstance(v, bool) or v is None:
+        return None
+    if isinstance(v, (int, float)):
+        return int(round(v))
+    m = re.fullmatch(r"\s*~?\s*(\d+(?:\.\d+)?)\s*(?:g|kcal)?\s*", str(v))
+    return int(round(float(m.group(1)))) if m else None
+
+
+def nutrition_of(r):
+    """Per-serving estimates: the recipe as written ("orig") and with the veg swap ("veg")."""
+    def block(prefix, fallback=None):
+        vals = {k: num(r.get(f"{prefix} {col}")) for k, col in
+                (("cal", "Calories"), ("protein", "Protein"), ("carbs", "Carbs"), ("fat", "Fat"))}
+        return vals if all(v is not None for v in vals.values()) else fallback
+    orig = block("Orig")
+    if not orig:  # older layout: only the plain estimate columns
+        orig = {k: num(r.get(col)) for k, col in (("cal", "Calories (per serving, est.)"), ("protein", "Protein (g, est.)"),
+                                                  ("carbs", "Carbs (g, est.)"), ("fat", "Fat (g, est.)"))}
+        if not all(v is not None for v in orig.values()):
+            return None
+    veg = block("Veg", orig)
+    serv = num(r.get("Servings (assumed)"))
+    return {"servings": serv, "orig": orig, "veg": veg}
+
+
+SWAP_WORDS = ["chicken breast", "chicken mince", "ground chicken", "shredded chicken", "chicken", "ground beef", "beef",
+              "ground pork", "pork", "ham", "pepperoni", "minced meat", "ground meat", "meat", "bacon", "sausage",
+              "liquid egg whites", "egg whites", "boiled eggs", "eggs", "egg"]
+
+
+# Smaller meat-based items a "fully veg" version also needs swapped, even when the Substitutes note doesn't name them.
+IMPLICIT_SWAPS = [
+    (["chicken stock cube", "chicken stock", "beef stock"], "vegetable stock"),
+    (["chicken broth", "beef broth", "bone broth"], "vegetable broth"),
+    (["chicken bouillon powder", "chicken bouillon", "beef bouillon"], "vegetable bouillon"),
+    (["chicken powder"], "vegetable stock powder"),
+    (["fish sauce"], "soy sauce"),
+    (["oyster sauce"], "vegetarian (mushroom) oyster sauce"),
+]
+
+
+def parse_swap(text, meat=False, raw_text=""):
+    """'Swap A for B (and C for D)' -> [{"from": [phrases to replace, longest first], "to": B}, ...]."""
+    text = clean_text(text)
+    if not text:
+        return None
+    pairs = []
+    for part in re.split(r"\(and |;|\band swap\b", text):
+        m = re.search(r"^(?:swap\s+)?(?:the\s+)?(.+?)\s+for\s+(.+)", part.strip().rstrip(")"), re.I)
+        if not m:
+            continue
+        frm, to = m.group(1).strip(), m.group(2).strip()
+        to = re.split(r"\s+\(or\b|,\s*or\b|\s+or\s+", to)[0]
+        to = re.sub(r"\s*\(.*$", "", to).strip().rstrip(".)")
+        to = re.sub(r"^(?:an?|some)\s+", "", to)
+        to = re.sub(r"^extra\s+(?=soy)", "", to)
+        to = re.sub(r"^\d+\s*g\s+", "", to)
+        variants = {frm}
+        for piece in re.split(r"/", frm):  # "ground beef/pork" -> ground beef, ground pork
+            piece = piece.strip()
+            if piece and " " not in piece and " " in frm.split("/")[0]:
+                piece = frm.split("/")[0].rsplit(" ", 1)[0] + " " + piece
+            variants.add(piece)
+        low = frm.lower()
+        if not re.search(r"(stock|broth|powder|sauce|bouillon)$", low):  # a stock swap leaves other "chicken" words alone
+            variants |= {w for w in SWAP_WORDS if re.search(r"\b" + re.escape(w) + r"\b", low)}
+        variants |= {v[:-1] for v in variants if v.endswith("s") and not v.endswith("ss")}  # "eggs" also catches "egg"
+        variants = sorted({v for v in variants if v}, key=len, reverse=True)
+        pairs.append({"from": variants, "to": to})
+    if pairs and meat:
+        taken = {v.lower() for p in pairs for v in p["from"]}
+        low = raw_text.lower()
+        extra = []
+        for frm, to in IMPLICIT_SWAPS:
+            frm = [f for f in frm if f not in taken and re.search(r"(?<!vegetarian )(?<!vegan )\b" + re.escape(f) + r"\b", low)]
+            if frm:
+                extra.append({"from": sorted(frm, key=len, reverse=True), "to": to})
+        pairs = extra + pairs  # specific stock/sauce phrases first, so "chicken broth" never becomes "tofu broth"
+    return {"text": text, "pairs": pairs} if pairs else None
+
+
 def build_data(xlsx_path):
     wb = openpyxl.load_workbook(xlsx_path)
     ws = wb.active
@@ -451,6 +534,9 @@ def build_data(xlsx_path):
             "ai": bool(r.get("AI-made")),
             "ingredients": ingredients,
             "method": split_steps(clean_text(r.get("Method"))),
+            "nutrition": nutrition_of(r),
+            "swap": parse_swap(r.get("Substitutes"), diet == "meat",
+                               " ".join(" ".join(i["raws"]) for i in ingredients) + " " + clean_text(r.get("Method"))),
         })
     aliases = {a: c for a, c in ALIAS if a != c and len(a) > 2}
     return {"recipes": recipes, "staples": sorted(STAPLES), "aliases": aliases}
